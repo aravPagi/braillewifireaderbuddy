@@ -1,0 +1,308 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>BrailleConnect — HC-05 Advanced (Web Serial)</title>
+<style>
+:root{--bg:#071021;--panel:#0e2133;--accent:#29b6f6;--muted:#9fb3c6}
+body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial;margin:0;background:linear-gradient(180deg,var(--bg),#02121a);color:#e6f7ff}
+.container{max-width:980px;margin:28px auto;padding:20px;background:var(--panel);border-radius:12px;box-shadow:0 10px 30px rgba(0,0,0,.6)}
+h1{font-size:1.6rem;color:var(--accent);margin-bottom:6px}
+.row{display:flex;gap:12px;align-items:center}
+.col{flex:1}
+.btn{background:var(--accent);border:none;padding:10px 14px;border-radius:8px;color:#012;cursor:pointer;font-weight:600}
+.btn.secondary{background:transparent;border:1px solid rgba(255,255,255,.06);color:#dff5ff}
+.btn:disabled{opacity:.5;cursor:not-allowed}
+.panel{background:rgba(255,255,255,0.02);padding:12px;border-radius:10px;margin-top:12px}
+textarea{width:100%;min-height:140px;padding:10px;border-radius:8px;background:transparent;border:1px solid rgba(255,255,255,.04);color:inherit;font-family:monospace}
+#dropZone{border:2px dashed rgba(255,255,255,0.04);padding:18px;text-align:center;border-radius:8px;color:var(--muted)}
+.progress{height:10px;background:rgba(255,255,255,0.04);border-radius:6px;margin-top:8px;overflow:hidden}
+.progress > i{display:block;height:100%;background:linear-gradient(90deg,var(--accent),#7c4dff);width:0%}
+.log{background:#021822;padding:10px;border-radius:8px;height:160px;overflow:auto;font-family:monospace;font-size:13px;color:#bfefff}
+.small{font-size:13px;color:var(--muted)}
+kbd{background:#0a2230;padding:4px 6px;border-radius:6px;color:var(--accent)}
+</style>
+</head>
+<body>
+<div class="container" role="main">
+  <h1>BrailleConnect — HC-05 (Advanced Web Serial)</h1>
+
+  <div class="panel row" style="align-items:center">
+    <div class="col">
+      <div class="small">Serial status: <strong id="status">Not connected</strong></div>
+      <div class="small">Port: <span id="portName">—</span></div>
+    </div>
+
+    <div style="display:flex;gap:8px">
+      <button id="connectBtn" class="btn">Connect</button>
+      <button id="disconnectBtn" class="btn secondary" disabled>Disconnect</button>
+    </div>
+  </div>
+
+  <div class="panel">
+    <div class="row" style="margin-bottom:8px">
+      <div class="col">
+        <div class="small">Send text / edit before sending</div>
+        <textarea id="editor" placeholder="Type text to send..."></textarea>
+      </div>
+      <div style="width:220px">
+        <div class="small">Send controls</div>
+        <div style="display:flex;flex-direction:column;gap:8px;margin-top:8px">
+          <input id="baud" value="9600" type="number" class="small" style="padding:8px;border-radius:6px;border:1px solid rgba(255,255,255,.04)"/>
+          <button id="sendBtn" class="btn" disabled>Send (buffered)</button>
+          <button id="sendFileBtn" class="btn secondary" disabled>Send .txt file</button>
+          <div class="small">Chunk size <input id="chunkSize" type="number" value="128" style="width:80px;padding:4px;border-radius:6px;border:1px solid rgba(255,255,255,.04)"/> bytes</div>
+          <div class="small">Delay between chunks <input id="chunkDelay" type="number" value="20" style="width:80px;padding:4px;border-radius:6px;border:1px solid rgba(255,255,255,.04)"/> ms</div>
+        </div>
+      </div>
+    </div>
+
+    <div id="dropZone">Drag & drop .txt file here or use <kbd>Send .txt file</kbd></div>
+    <input id="fileInput" type="file" accept=".txt" style="display:none" />
+
+    <div class="progress" aria-hidden="false" style="margin-top:12px"><i id="progressBar"></i></div>
+  </div>
+
+  <div class="panel" style="margin-top:14px">
+    <div class="row">
+      <div class="col">
+        <div class="small">Received / Device Output</div>
+        <div id="received" class="log" aria-live="polite"></div>
+      </div>
+      <div style="width:260px">
+        <div class="small">Actions</div>
+        <div style="display:flex;flex-direction:column;gap:8px;margin-top:8px">
+          <button id="saveReceivedBtn" class="btn secondary" disabled>Download Received</button>
+          <button id="clearLogBtn" class="btn secondary">Clear</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="small" style="margin-top:10px;color:var(--muted)">
+    Use Chrome / Edge. HC-05 connected to Arduino must be bridged to PC over USB. If you use an ESP32 (BLE) choose BLE mode (separate webpage).
+  </div>
+</div>
+
+<script>
+/* Advanced Web Serial logic for HC-05 (Arduino bridge)
+   - chunked transfers with configurable size/delay
+   - auto reconnect attempt
+   - safe DOM updates
+*/
+
+const connectBtn = document.getElementById('connectBtn');
+const disconnectBtn = document.getElementById('disconnectBtn');
+const statusEl = document.getElementById('status');
+const portNameEl = document.getElementById('portName');
+const editor = document.getElementById('editor');
+const sendBtn = document.getElementById('sendBtn');
+const sendFileBtn = document.getElementById('sendFileBtn');
+const dropZone = document.getElementById('dropZone');
+const fileInput = document.getElementById('fileInput');
+const receivedEl = document.getElementById('received');
+const progressBar = document.getElementById('progressBar');
+const saveReceivedBtn = document.getElementById('saveReceivedBtn');
+const clearLogBtn = document.getElementById('clearLogBtn');
+const chunkSizeInput = document.getElementById('chunkSize');
+const chunkDelayInput = document.getElementById('chunkDelay');
+const baudInput = document.getElementById('baud');
+
+let port = null;
+let reader = null;
+let writer = null;
+let keepReading = false;
+let receivedText = '';
+
+function logSafe(msg){
+  // append text safely (no innerHTML)
+  receivedText += msg;
+  receivedEl.textContent = receivedText;
+  receivedEl.scrollTop = receivedEl.scrollHeight;
+  saveReceivedBtn.disabled = receivedText.length === 0;
+}
+
+function setStatus(s){
+  statusEl.textContent = s;
+}
+
+async function connectSerial(){
+  try {
+    // request port
+    port = await navigator.serial.requestPort();
+    const baud = Number(baudInput.value) || 9600;
+    await port.open({ baudRate: baud });
+    setStatus('Connected');
+    portNameEl.textContent = (port.getInfo && JSON.stringify(port.getInfo())) || 'USB Serial';
+    connectBtn.disabled = true;
+    disconnectBtn.disabled = false;
+    sendBtn.disabled = false;
+    sendFileBtn.disabled = false;
+    keepReading = true;
+    readLoop();
+    // create writer
+    writer = port.writable.getWriter();
+    logSafe('[system] serial opened\\n');
+  } catch (err){
+    alert('Serial connection failed: ' + String(err));
+    setStatus('Not connected');
+  }
+}
+
+async function disconnectSerial(){
+  try {
+    keepReading = false;
+    if (reader) { await reader.cancel(); reader.releaseLock(); reader = null; }
+    if (writer) { try { writer.releaseLock(); } catch(e){} writer=null; }
+    if (port) { await port.close(); port = null; }
+  } catch(e){
+    console.warn('disconnect error', e);
+  } finally {
+    setStatus('Not connected');
+    portNameEl.textContent = '—';
+    connectBtn.disabled = false;
+    disconnectBtn.disabled = true;
+    sendBtn.disabled = true;
+    sendFileBtn.disabled = true;
+  }
+}
+
+async function readLoop(){
+  try {
+    const textDecoder = new TextDecoder();
+    reader = port.readable.getReader();
+    while (keepReading){
+      const { value, done } = await reader.read();
+      if (done) break;
+      if (value) {
+        const text = textDecoder.decode(value);
+        // normalize CRLF so it displays well
+        logSafe(text.replace(/\\r/g,''));
+      }
+    }
+  } catch (err){
+    console.warn('readLoop error', err);
+    logSafe('\\n[system] read error: ' + String(err) + '\\n');
+  } finally {
+    if (reader) {
+      try { reader.releaseLock(); } catch(e){}
+      reader = null;
+    }
+    // If port still exists, try to auto-reconnect once after short delay
+    if (port) {
+      logSafe('\\n[system] attempting auto-reconnect in 2s...\\n');
+      setTimeout(async ()=> {
+        if (!port) return;
+        try {
+          await port.open({ baudRate: Number(baudInput.value)||9600 });
+          keepReading = true;
+          readLoop();
+          logSafe('[system] reconnected\\n');
+        } catch(e){ logSafe('[system] reconnect failed\\n'); }
+      }, 2000);
+    }
+  }
+}
+
+// send raw text (non-blocking single chunk)
+async function sendRaw(text){
+  if (!writer) {
+    alert('Not connected');
+    return;
+  }
+  const enc = new TextEncoder();
+  const data = enc.encode(text);
+  try {
+    await writer.write(data);
+    logSafe('[sent] ' + (text.length>50 ? text.slice(0,50)+'...' : text) + '\\n');
+  } catch(e){
+    console.error('write error', e);
+    logSafe('[system] write error: ' + String(e) + '\\n');
+  }
+}
+
+// chunked send (for file transfer, prevents HC-05 overflow)
+async function sendChunked(text, chunkSize=128, delayMs=20){
+  if (!writer) { alert('Not connected'); return; }
+  const enc = new TextEncoder();
+  const bytes = enc.encode(text);
+  const total = bytes.length;
+  let sent = 0;
+  progressBar.style.width = '0%';
+  while (sent < total){
+    const end = Math.min(sent + chunkSize, total);
+    const slice = bytes.subarray(sent, end);
+    try {
+      await writer.write(slice);
+    } catch(e){ logSafe('[system] write failure: '+String(e)+'\\n'); break; }
+    sent = end;
+    const pct = Math.round((sent/total)*100);
+    progressBar.style.width = pct + '%';
+    await new Promise(r => setTimeout(r, delayMs));
+  }
+  progressBar.style.width = '0%';
+  logSafe('[sent file] ' + total + ' bytes\\n');
+}
+
+// file helpers
+function handleFileObject(file){
+  const reader = new FileReader();
+  reader.onload = async (ev) => {
+    const text = ev.target.result;
+    const cs = Number(chunkSizeInput.value) || 128;
+    const cd = Number(chunkDelayInput.value) || 20;
+    await sendChunked(text, cs, cd);
+  };
+  reader.readAsText(file);
+}
+
+// UI wiring
+connectBtn.addEventListener('click', connectSerial);
+disconnectBtn.addEventListener('click', disconnectSerial);
+sendBtn.addEventListener('click', ()=> {
+  const text = editor.value;
+  if (!text) return alert('Nothing to send');
+  sendRaw(text + '\\n');
+});
+
+sendFileBtn.addEventListener('click', ()=> fileInput.click());
+fileInput.addEventListener('change', ()=> {
+  const f = fileInput.files[0];
+  if (f) handleFileObject(f);
+});
+
+// drag & drop
+dropZone.addEventListener('dragover', (e)=>{ e.preventDefault(); dropZone.style.borderColor = 'rgba(255,255,255,0.12)'; });
+dropZone.addEventListener('dragleave', ()=> dropZone.style.borderColor = '');
+dropZone.addEventListener('drop', (e)=> {
+  e.preventDefault();
+  dropZone.style.borderColor = '';
+  const f = e.dataTransfer.files[0];
+  if (f && f.name.toLowerCase().endsWith('.txt')) handleFileObject(f);
+  else alert('Please drop a .txt file');
+});
+
+clearLogBtn.addEventListener('click', ()=> { receivedText=''; receivedEl.textContent=''; saveReceivedBtn.disabled=true; });
+saveReceivedBtn.addEventListener('click', ()=> {
+  const blob = new Blob([receivedText], {type:'text/plain'});
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = 'received_' + Date.now() + '.txt';
+  a.click();
+  URL.revokeObjectURL(a.href);
+});
+
+// on page unload close serial gracefully
+window.addEventListener('beforeunload', async (e)=> {
+  try { await disconnectSerial(); } catch(e){}
+});
+
+// feature detect
+if (!('serial' in navigator)) {
+  alert('Web Serial API not supported. Use Chrome/Edge and enable experimental flags if needed. This app relies on Web Serial.');
+}
+</script>
+</body>
+</html>
+
